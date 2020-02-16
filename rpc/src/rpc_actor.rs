@@ -2,34 +2,17 @@
 // SPDX-License-Identifier: MIT
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
 
-use getset::Getters;
 use riker::actors::*;
-use slog::warn;
 use tokio::runtime::Handle;
 
-use crypto::hash::ChainId;
 use shell::shell_channel::{BlockApplied, ShellChannelMsg, ShellChannelRef, ShellChannelTopic};
 use storage::persistent::PersistentStorage;
 use tezos_api::client::TezosStorageInitInfo;
 
-use crate::server::{RpcServiceEnvironment, spawn_server};
+use crate::server::{RpcCollectedState, RpcCollectedStateRef, RpcServiceEnvironment, spawn_server};
 
 pub type RpcServerRef = ActorRef<RpcServerMsg>;
-
-/// Thread safe reference to a shared RPC state
-pub(crate) type RpcCollectedStateRef = Arc<RwLock<RpcCollectedState>>;
-
-/// Represents various collected information about
-/// internal state of the node.
-#[derive(Getters)]
-pub(crate) struct RpcCollectedState {
-    #[get = "pub(crate)"]
-    current_head: Option<BlockApplied>,
-    #[get = "pub(crate)"]
-    chain_id: ChainId,
-}
 
 /// Actor responsible for managing HTTP REST API and server, and to share parts of inner actor
 /// system with the server.
@@ -47,26 +30,15 @@ impl RpcServer {
     }
 
     pub fn actor(sys: &ActorSystem, shell_channel: ShellChannelRef, rpc_listen_address: SocketAddr, tokio_executor: &Handle, persistent_storage: &PersistentStorage, tezos_info: &TezosStorageInitInfo) -> Result<RpcServerRef, CreateError> {
-        let shared_state = Arc::new(RwLock::new(RpcCollectedState {
-            current_head: load_current_head(persistent_storage),
-            chain_id: tezos_info.chain_id.clone(),
-        }));
+        let shared_state = RpcCollectedStateRef::new(RpcCollectedState::new(load_current_head(persistent_storage), tezos_info.chain_id.clone()));
         let actor_ref = sys.actor_of(
             Props::new_args(Self::new, (shell_channel, shared_state.clone())),
             Self::name(),
         )?;
 
         // spawn RPC JSON server
-        {
-            let env = RpcServiceEnvironment::new(sys.clone(), actor_ref.clone(), persistent_storage, &tezos_info.genesis_block_header_hash, shared_state, sys.log());
-            let inner_log = sys.log();
-
-            tokio_executor.spawn(async move {
-                if let Err(e) = spawn_server(&rpc_listen_address, env).await {
-                    warn!(inner_log, "HTTP Server encountered failure"; "error" => format!("{}", e));
-                }
-            });
-        }
+        let env = RpcServiceEnvironment::new(sys.clone(), actor_ref.clone(), persistent_storage, &tezos_info.genesis_block_header_hash, shared_state, sys.log());
+        tokio_executor.spawn(spawn_server(env));
 
         Ok(actor_ref)
     }
@@ -94,14 +66,17 @@ impl Receive<ShellChannelMsg> for RpcServer {
         match msg {
             ShellChannelMsg::BlockApplied(block) => {
                 let current_head_ref = &mut *self.state.write().unwrap();
-                match &mut current_head_ref.current_head {
+                match current_head_ref.current_head() {
                     Some(current_head) => {
-                        if current_head.header().header.level() < block.header().header.level() {
-                            *current_head = block;
+                        let have_seen_newer_head = current_head.header().header.level() < block.header().header.level();
+                        if have_seen_newer_head {
+                            current_head_ref.set_current_head(Some(block));
                         }
                     }
-                    None => current_head_ref.current_head = Some(block)
-                }
+                    None => {
+                        current_head_ref.set_current_head(Some(block));
+                    }
+               };
             }
             _ => (/* Not yet implemented, do nothing */),
         }

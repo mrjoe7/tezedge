@@ -22,10 +22,9 @@ use crate::{
     ServiceResult,
     ts_to_rfc3339,
 };
-use crate::rpc_actor::RpcCollectedStateRef;
-use crate::helpers::RpcResponseData;
 use crate::ContextList;
-
+use crate::helpers::RpcResponseData;
+use crate::rpc_actor::RpcCollectedStateRef;
 
 #[derive(Debug)]
 enum Route {
@@ -474,35 +473,34 @@ fn unwrap_block_hash(block_id: Option<String>, state: RpcCollectedStateRef, gene
 
 
 /// This submodule contains service functions implementation.
-mod fns {
+pub mod fns {
     use std::collections::{HashMap, HashSet};
     use std::convert::TryInto;
+
+    use failure::{bail, format_err};
     use itertools::Itertools;
     use serde::{Deserialize, Serialize};
 
-    use failure::{bail, format_err};
-
-    use crypto::hash::{BlockHash, ChainId, HashType};
     use crypto::blake2b;
-    
+    use crypto::hash::{BlockHash, ChainId, HashType};
     use shell::shell_channel::BlockApplied;
     use shell::stats::memory::{Memory, MemoryData, MemoryStatsResult};
     use storage::{BlockHeaderWithHash, BlockMetaStorage, BlockStorage, BlockStorageReader, ContextRecordValue, ContextStorage};
     use storage::block_storage::BlockJsonData;
     use storage::context_storage::ContractAddress;
+    use storage::num_from_slice;
     use storage::persistent::PersistentStorage;
     use storage::skip_list::Bucket;
-    use storage::num_from_slice;
     use tezos_context::channel::ContextAction;
-    
+
     use crate::ContextList;
     use crate::encoding::context::ContextConstants;
-    use crate::merge_slices;
-    use crate::helpers::{FullBlockInfo, BlockHeaderInfo, PagedResult, RpcResponseData, EndorsingRight, CycleData, cycle_from_level, get_pseudo_random_number, init_prng, RightsParams, RightsConstants, EndorserSlots};
-    use crate::rpc_actor::RpcCollectedStateRef;
-    use crate::ts_to_rfc3339;
-
+    use crate::helpers::{BlockHeaderInfo, cycle_from_level, CycleData, EndorserSlots, EndorsingRight, FullBlockInfo, get_pseudo_random_number, init_prng, PagedResult, RightsConstants, RightsParams, RpcResponseData};
     use crate::helpers::BakingRights;
+    use crate::merge_slices;
+    use crate::rpc_actor::RpcCollectedStateRef;
+    use crate::server::RpcCollectedStateRef;
+    use crate::ts_to_rfc3339;
 
     // Serialize, Deserialize,
     #[derive(Serialize, Deserialize, Debug)]
@@ -901,29 +899,25 @@ mod fns {
     }
 
     /// Get information about current head
-    pub(crate) fn get_full_current_head(state: RpcCollectedStateRef) -> Result<Option<FullBlockInfo>, failure::Error> {
+    pub(crate) fn get_full_current_head(state: &RpcCollectedStateRef) -> Option<FullBlockInfo> {
         let state = state.read().unwrap();
-        let current_head = state.current_head().as_ref().map(|current_head| {
+        state.current_head().as_ref().map(|current_head| {
             let chain_id = chain_id_to_string(state.chain_id());
             FullBlockInfo::new(current_head, &chain_id)
-        });
-
-        Ok(current_head)
+        })
     }
 
     /// Get information about current head header
-    pub(crate) fn get_current_head_header(state: RpcCollectedStateRef) -> Result<Option<BlockHeaderInfo>, failure::Error> {
+    pub(crate) fn get_current_head_header(state: &RpcCollectedStateRef) -> Option<BlockHeaderInfo> {
         let state = state.read().unwrap();
-        let current_head = state.current_head().as_ref().map(|current_head| {
+        state.current_head().as_ref().map(|current_head| {
             let chain_id = chain_id_to_string(state.chain_id());
             BlockHeaderInfo::new(current_head, &chain_id)
-        });
-
-        Ok(current_head)
+        })
     }
 
     /// Get information about block
-    pub(crate) fn get_full_block(block_id: &str, persistent_storage: &PersistentStorage, state: RpcCollectedStateRef) -> Result<Option<FullBlockInfo>, failure::Error> {
+    pub(crate) fn get_full_block(block_id: &str, persistent_storage: &PersistentStorage, state: &RpcCollectedStateRef) -> Result<Option<FullBlockInfo>, failure::Error> {
         let block_storage = BlockStorage::new(persistent_storage);
         let block_hash = block_id_to_block_hash(block_id, persistent_storage)?;
         let block = block_storage.get_with_json_data(&block_hash)?.map(|(header, json_data)| map_header_and_json_to_full_block_info(header, json_data, &state));
