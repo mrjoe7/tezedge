@@ -1,16 +1,19 @@
 // Copyright (c) SimpleStaking and Tezedge Contributors
 // SPDX-License-Identifier: MIT
 
+use std::{io, thread};
 use std::cell::RefCell;
 use std::convert::AsRef;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use failure::Fail;
 use getset::{CopyGetters, Getters};
 use serde::{Deserialize, Serialize};
+use slog::{crit, debug, info, Logger};
 use strum_macros::IntoStaticStr;
 use wait_timeout::ChildExt;
 
@@ -303,30 +306,6 @@ impl IpcEvtServer {
         let (rx, _) = self.0.accept()?;
         Ok(rx)
     }
-
-    pub fn client_path(&self) -> PathBuf {
-        self.0.client().path().to_path_buf()
-    }
-}
-
-/// Endpoint consists of a protocol runner and IPC communication (command and event channels).
-pub struct ProtocolRunnerEndpoint {
-    pub runner: ProtocolRunner,
-    pub commands: IpcCmdServer,
-    pub events: IpcEvtServer,
-}
-
-impl ProtocolRunnerEndpoint {
-    pub fn new(configuration: ProtocolEndpointConfiguration) -> ProtocolRunnerEndpoint {
-        let protocol_runner_path = configuration.executable_path.clone();
-        let evt_server = IpcEvtServer::new();
-        let cmd_server = IpcCmdServer::new(configuration);
-        ProtocolRunnerEndpoint {
-            runner: ProtocolRunner::new(&protocol_runner_path, cmd_server.0.client().path(), evt_server.0.client().path()),
-            commands: cmd_server,
-            events: evt_server,
-        }
-    }
 }
 
 struct IpcIO {
@@ -438,8 +417,8 @@ impl<'a> ProtocolController<'a> {
     /// Gets data for genesis.
     pub fn genesis_result_data(&self, genesis_context_hash: &ContextHash) -> Result<CommitGenesisResult, ProtocolServiceError> {
         let tezos_environment = self.configuration.environment();
-        let main_chain_id = tezos_environment.main_chain_id().map_err(|e| ProtocolServiceError::InvalidDataError { message: format!("{:?}", e)})?;
-        let protocol_hash = tezos_environment.genesis_protocol().map_err(|e| ProtocolServiceError::InvalidDataError { message: format!("{:?}", e)})?;
+        let main_chain_id = tezos_environment.main_chain_id().map_err(|e| ProtocolServiceError::InvalidDataError { message: format!("{:?}", e) })?;
+        let protocol_hash = tezos_environment.genesis_protocol().map_err(|e| ProtocolServiceError::InvalidDataError { message: format!("{:?}", e) })?;
 
         let mut io = self.io.borrow_mut();
         io.tx.send(&ProtocolMessage::GenesisResultDataCall(GenesisResultDataParams {
@@ -462,25 +441,99 @@ impl Drop for ProtocolController<'_> {
     }
 }
 
+/// Endpoint consists of a protocol runner and IPC communication (command and event channels).
+pub struct ProtocolRunnerEndpoint<Runner: ProtocolRunner> {
+    pub name: String,
+    runner: Runner,
+    log: Logger,
+
+    pub commands: IpcCmdServer,
+    pub events: IpcEvtServer,
+}
+
+impl<Runner: ProtocolRunner + 'static> ProtocolRunnerEndpoint<Runner> {
+    pub fn new(name: &str, configuration: ProtocolEndpointConfiguration, log: Logger) -> ProtocolRunnerEndpoint<Runner> {
+        let evt_server = IpcEvtServer::new();
+        let cmd_server = IpcCmdServer::new(configuration.clone());
+        ProtocolRunnerEndpoint {
+            name: name.to_string(),
+            runner: Runner::new(configuration, cmd_server.0.client().path(), evt_server.0.client().path()),
+            commands: cmd_server,
+            events: evt_server,
+            log,
+        }
+    }
+
+    /// Starts protocol runner sub-process just once and you can take care of it
+    pub fn start(&self) -> Result<Child, ProtocolServiceError> {
+        info!(self.log, "Starting protocol runner process"; "endpoint" => self.name.clone());
+        self.runner.spawn()
+    }
+
+    /// Starts protocol runner sub-process and takes care of it automatically.
+    /// If sub-process failed, it is automatically spawned another sub-process.
+    /// Returns AtomicBool, if set to false, than terminates sub-process
+    pub fn start_in_restarting_mode(&mut self) -> Result<Arc<AtomicBool>, ProtocolServiceError> {
+        let run_restarting_feature = Arc::new(AtomicBool::new(true));
+        {
+            let log = self.log.clone();
+            let run = run_restarting_feature.clone();
+            let runner = self.runner.clone();
+            let name = self.name.clone();
+            let mut protocol_runner_process = self.start()?;
+
+            // watchdog thread, which checks if sub-process is running, if not, than starts new one
+            thread::spawn(move || {
+                while run.load(Ordering::Acquire) {
+                    if !Runner::is_running(&mut protocol_runner_process) {
+                        info!(log, "Restarting protocol runner process"; "endpoint" => name.clone());
+                        protocol_runner_process = match runner.spawn() {
+                            Ok(process) => {
+                                info!(log, "Protocol runner restarted successfully"; "endpoint" => name.clone());
+                                process
+                            }
+                            Err(e) => {
+                                crit!(log, "Failed to spawn protocol runner process"; "endpoint" => name.clone(), "reason" => e);
+                                break;
+                            }
+                        };
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                debug!(log, "Protocol runner stopped restarting_mode"; "endpoint" => name.clone());
+
+                if Runner::is_running(&mut protocol_runner_process) {
+                    Runner::terminate(protocol_runner_process);
+                }
+            })
+        };
+
+        Ok(run_restarting_feature)
+    }
+}
+
 /// Control protocol runner sub-process.
-pub struct ProtocolRunner {
+#[derive(Clone)]
+pub struct ExecutableProtocolRunner {
     sock_cmd_path: PathBuf,
     sock_evt_path: PathBuf,
     executable_path: PathBuf,
 }
 
-impl ProtocolRunner {
+impl ExecutableProtocolRunner {
     const PROCESS_WAIT_TIMEOUT: Duration = Duration::from_secs(4);
+}
 
-    pub fn new<P: AsRef<Path>>(executable_path: P, sock_cmd_path: &Path, sock_evt_path: &Path) -> Self {
-        ProtocolRunner {
+impl ProtocolRunner for ExecutableProtocolRunner {
+    fn new(configuration: ProtocolEndpointConfiguration, sock_cmd_path: &Path, sock_evt_path: &Path) -> Self {
+        ExecutableProtocolRunner {
             sock_cmd_path: sock_cmd_path.to_path_buf(),
             sock_evt_path: sock_evt_path.to_path_buf(),
-            executable_path: executable_path.as_ref().to_path_buf(),
+            executable_path: configuration.executable_path.clone(),
         }
     }
 
-    pub fn spawn(&self) -> Result<Child, ProtocolServiceError> {
+    fn spawn(&self) -> Result<Child, ProtocolServiceError> {
         let process = Command::new(&self.executable_path)
             .arg("--sock-cmd")
             .arg(&self.sock_cmd_path)
@@ -491,7 +544,7 @@ impl ProtocolRunner {
         Ok(process)
     }
 
-    pub fn terminate(mut process: Child) {
+    fn terminate(mut process: Child) {
         match process.wait_timeout(Self::PROCESS_WAIT_TIMEOUT).unwrap() {
             Some(_) => (),
             None => {
@@ -501,7 +554,7 @@ impl ProtocolRunner {
         };
     }
 
-    pub fn is_running(process: &mut Child) -> bool {
+    fn is_running(process: &mut Child) -> bool {
         match process.try_wait() {
             Ok(None) => true,
             _ => false,
@@ -509,3 +562,12 @@ impl ProtocolRunner {
     }
 }
 
+pub trait ProtocolRunner: Clone + Send {
+    fn new(configuration: ProtocolEndpointConfiguration, sock_cmd_path: &Path, sock_evt_path: &Path) -> Self;
+
+    fn spawn(&self) -> Result<Child, ProtocolServiceError>;
+
+    fn terminate(process: Child);
+
+    fn is_running(process: &mut Child) -> bool;
+}
